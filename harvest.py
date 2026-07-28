@@ -519,6 +519,30 @@ def coverage(base: Path) -> dict:
     return out
 
 
+
+# 重試次數與間隔。**為什麼需要**：排程是無人值守的，而 openapi 漏掉的交易日
+# **補不回來**。實測 2026-07-28 遇過上游瞬間回非 JSON（維護頁），重試即成功。
+# 不重試就等於為了一次抖動永久少一天資料。
+_RETRIES = 3
+_RETRY_WAIT = 20.0
+
+
+def _with_retry(fn, label: str):
+    """取數＋解析一起重試——失敗常是上游回了錯誤頁（解析階段才發現）。"""
+    import time
+    last = None
+    for attempt in range(1, _RETRIES + 1):
+        try:
+            return fn()
+        except HarvestError as exc:
+            last = exc
+            if attempt < _RETRIES:
+                print(f"  [ 重試] {label:<12} 第 {attempt} 次失敗（{str(exc)[:50]}）"
+                      f"，{_RETRY_WAIT:.0f} 秒後重試")
+                time.sleep(_RETRY_WAIT)
+    raise last
+
+
 # ---------------------------------------------------------------- 流程
 def run(base: Path) -> int:
     print(f"輸出：{base / DIRNAME}\n")
@@ -547,7 +571,7 @@ def run(base: Path) -> int:
     ]
     for kind, label, fn, source in jobs:
         try:
-            result = fn()
+            result = _with_retry(fn, label)
             trade_date, rows = result[0], result[1]
             prev_bal = result[2] if len(result) > 2 else None
             if not rows:
