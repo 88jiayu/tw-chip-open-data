@@ -475,8 +475,11 @@ def save(base: Path, kind: str, trade_date: date, rows: dict, source: str) -> tu
     d = Path(base) / DIRNAME / kind
     d.mkdir(parents=True, exist_ok=True)
     f = d / f"{trade_date.isoformat()}.json"
-    checksum = hashlib.sha256(
-        json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    # checksum 涵蓋**資料值＋來源＋授權別**，與私有版
+    # `providers.official_daily_store` 同義——兩邊算法不同會讓跨庫比對失準。
+    checksum = hashlib.sha256(json.dumps(
+        {"rows": rows, "source": source, "license": LICENSE_OPEN},
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     revision, previous = 1, None
     if f.exists():
