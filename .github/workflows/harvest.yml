@@ -1,0 +1,82 @@
+# 每交易日收集台股籌碼開放資料，commit 回本 repo。
+#
+# 安全設計（逐項刻意為之）：
+#  · **不需要任何憑證/token** —— openapi 匿名可取。repo 不設任何 secret。
+#  · **不執行 pip install** —— harvest.py 純標準庫。CI 沒有供應鏈攻擊面。
+#  · **只有 schedule 與 workflow_dispatch 觸發**。刻意不掛 pull_request：
+#    公開 repo 任何人都能開 PR，若 PR 能觸發帶寫入權的流程就等於把 repo 交出去。
+#  · permissions 只給 contents: write（commit 資料所需的最小權限）。
+#  · harvest.py 內建主機白名單，只連 openapi.twse.com.tw 與 www.tpex.org.tw，
+#    且不跟隨跨主機重導。
+#  · 個人模式限定的 rwd 端點**在本 repo 完全不存在** —— 不可散布的資料
+#    結構上就進不來，不必依賴任何人記得檢查。
+name: harvest
+
+on:
+  schedule:
+    # 14:00 UTC = 台北 22:00（官方日盤資料當晚更新完畢）。
+    # GitHub 排程在尖峰可能延遲；本流程冪等，晚跑無妨。
+    - cron: "0 14 * * 1-5"
+  workflow_dispatch:
+
+concurrency:
+  group: harvest
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # 刻意沒有 pip install：harvest.py 零第三方相依。
+      - name: 收集
+        run: python harvest.py --dir data
+
+      - name: 檢查是否有新資料
+        id: diff
+        run: |
+          if [ -n "$(git status --porcelain data)" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "沒有新資料（假日或當日尚未發布）—— 正常結束"
+          fi
+
+      # 最後一道防線：只有 license=open 的資料可以留在公開 repo。
+      # 理論上 harvest.py 只會產生 open，但防線的價值就在於「萬一」。
+      - name: 驗證資料授權別
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          python - <<'PY'
+          import json, pathlib, sys
+          bad = []
+          for f in pathlib.Path("data/official").rglob("*.json"):
+              try:
+                  doc = json.loads(f.read_text(encoding="utf-8"))
+              except Exception as exc:
+                  bad.append(f"{f}: 無法解析 ({type(exc).__name__})")
+                  continue
+              if doc.get("license") != "open":
+                  bad.append(f"{f}: license={doc.get('license')!r}")
+          if bad:
+              print("非開放授權資料混入公開 repo：", *bad, sep="\n  ")
+              sys.exit(1)
+          print("全部為開放授權資料 ✔")
+          PY
+
+      - name: commit
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          git commit -m "chore(data): 每日收集 $(date -u +%Y-%m-%d)"
+          git push
