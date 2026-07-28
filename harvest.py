@@ -34,6 +34,7 @@ import ssl
 import sys
 import urllib.request
 from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation
 from http.client import HTTPException
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -42,6 +43,7 @@ from urllib.parse import urlsplit
 SCHEMA_VERSION = 1
 DIRNAME = "official"
 LICENSE_OPEN = "open"          # 本檔**只會**產生 open；personal 來源在此不存在
+OGDL_URL = "https://data.gov.tw/license"
 ATTRIBUTION = {
     "twse": "資料來源：臺灣證券交易所",
     "tpex": "資料來源：證券櫃檯買賣中心",
@@ -220,11 +222,18 @@ def _dec(v) -> str | None:
         return None
     if not re.fullmatch(r"[+-]?\d+(\.\d+)?", s):
         return None
+    try:
+        Decimal(s)
+    except InvalidOperation:
+        return None
     # "0.00" 是官方對零成交的表示，不是價格；放行會在回測產生 -100% 假虧損。
-    return None if float(s) <= 0 else s
+    # **用 Decimal 比較不用 float**：本專案禁浮點碰金額，這裡漏了一處
+    #（2026-07-28 外部複驗指出）。極端字串（如 "1e-9"）在 float 與 Decimal 下
+    #  的邊界行為可能分叉，與私有版產生不一致。
+    return None if Decimal(s) <= 0 else s
 
 
-def parse_twse_margin(raw: bytes, anchor: bytes) -> tuple[date, dict]:
+def parse_twse_margin(raw: bytes, anchor: bytes) -> tuple[date, dict, dict]:
     """上市融資融券。
 
     ``MI_MARGN`` **沒有日期欄且會落後**（實測 2026-07-27 當天供 07-24）。
@@ -234,6 +243,7 @@ def parse_twse_margin(raw: bytes, anchor: bytes) -> tuple[date, dict]:
     trade_date = _one_date((r.get("Date") for r in load_json(anchor, "STOCK_DAY_ALL")
                             if isinstance(r, dict)), "STOCK_DAY_ALL")
     out: dict[str, list[int]] = {}
+    prev_bal: dict[str, tuple[int, int]] = {}
     for r in load_json(raw, "MI_MARGN"):
         if not isinstance(r, dict):
             continue
@@ -254,8 +264,11 @@ def parse_twse_margin(raw: bytes, anchor: bytes) -> tuple[date, dict]:
             continue
         if v["mt"] < 0 or v["st"] < 0:
             continue
+        if sid in out:
+            continue                      # 重複代號＝上游異常，不靜默覆蓋
+        prev_bal[sid] = (v["mp"], v["sp"])
         out[sid] = [v["mt"], v["st"]]
-    return trade_date, out
+    return trade_date, out, prev_bal
 
 
 def parse_tpex_margin(raw: bytes) -> tuple[date, dict]:
@@ -361,6 +374,91 @@ def parse_tpex_price(raw: bytes) -> tuple[date, dict]:
     return trade_date, out
 
 
+
+# ---------------------------------------------------------------- 日期驗證
+VERIFY_OK, VERIFY_SKIPPED, VERIFY_FAILED = "verified", "skipped", "failed"
+_MIN_OVERLAP_POP = 50
+
+
+def _gap_accounted(prev_date: date, trade_date: date, known_no_data) -> bool:
+    """兩日之間的平日是否都已確認無交易。有身分不明的平日 → 無從判定日期。"""
+    from datetime import timedelta
+    d = prev_date + timedelta(days=1)
+    while d < trade_date:
+        if d.weekday() < 5 and d.isoformat() not in known_no_data:
+            return False
+        d += timedelta(days=1)
+    return True
+
+
+def verify_date_by_balance_chain(prev_balances, trade_date, previous_day_rows,
+                                 previous_date=None, known_no_data=(),
+                                 sample: int = 200) -> tuple[str, str]:
+    """用「前日餘額」驗證日期是否標對。**不靠任何外部來源。**
+
+    上市 ``MI_MARGN`` 沒有日期欄，日期取自姊妹表 ``STOCK_DAY_ALL``；
+    「兩表同發布週期」只是觀察到的事實、不是保證。哪天不同步就會**全檔靜默
+    錯標日期**——而回測會拿錯天的籌碼配錯天的價格，不會有任何錯誤訊息。
+
+    公開版原本沒有這道閘（私有版有），雲端收集因此可能靜默錯標
+    （2026-07-28 外部複驗指出）。
+    """
+    if previous_day_rows is None:
+        return VERIFY_FAILED, "前一交易日資料讀取失敗（檔案毀損）"
+    if not previous_day_rows or not prev_balances:
+        return VERIFY_SKIPPED, "無前一交易日資料可比對（首次收集）"
+    if previous_date is not None and not _gap_accounted(previous_date, trade_date,
+                                                        set(known_no_data)):
+        return VERIFY_SKIPPED, "區間內有既無資料也未確認無交易的平日 —— 無法斷定日期"
+    checked = matched = 0
+    for sid, (m_prev, s_prev) in prev_balances.items():
+        old = previous_day_rows.get(sid)
+        if old is None:
+            continue
+        checked += 1
+        if list(old) == [m_prev, s_prev]:
+            matched += 1
+        if checked >= sample:
+            break
+    if checked == 0:
+        both_large = (len(previous_day_rows) >= _MIN_OVERLAP_POP
+                      and len(prev_balances) >= _MIN_OVERLAP_POP)
+        if both_large:
+            return VERIFY_FAILED, "零交集但兩日皆有大量標的 —— 日期可能錯配"
+        return VERIFY_SKIPPED, "無共同標的可比對（樣本過小）"
+    rate = matched / checked
+    if rate >= 0.9:
+        return VERIFY_OK, f"餘額鏈 {matched}/{checked} 吻合（{rate:.1%}）"
+    return VERIFY_FAILED, f"餘額鏈僅 {matched}/{checked} 吻合（{rate:.1%}）"
+
+
+def load_day(base: Path, kind: str, trade_date: date):
+    """讀已落地的某天 → ``{sid: [值…]}``；缺檔回 {}，毀損回 None（要分得開）。"""
+    f = Path(base) / DIRNAME / kind / f"{trade_date.isoformat()}.json"
+    if not f.exists():
+        return {}
+    try:
+        doc = json.loads(f.read_text(encoding="utf-8"))
+        rows = doc.get("rows")
+        return rows if isinstance(rows, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def stored_dates(base: Path, kind: str) -> list[date]:
+    d = Path(base) / DIRNAME / kind
+    if not d.is_dir():
+        return []
+    out = []
+    for f in d.glob("*.json"):
+        try:
+            y, m, dd = f.stem.split("-")
+            out.append(date(int(y), int(m), int(dd)))
+        except ValueError:
+            continue
+    return sorted(out)
+
+
 # ---------------------------------------------------------------- 落地
 def _safe_kind(kind: str) -> str:
     if not _KIND_RE.match(kind or "") or kind not in KIND_FIELDS:
@@ -397,6 +495,10 @@ def save(base: Path, kind: str, trade_date: date, rows: dict, source: str) -> tu
         "trade_date": trade_date.isoformat(), "source": source,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "fields": list(KIND_FIELDS[kind]),
+        # 顯名義務：OGDL §三(二) 未標示視為自始未取得授權。每檔自帶出處，
+        # README 有不夠——單獨拿走一個資料檔就沒有了。
+        "attribution": ATTRIBUTION["tpex" if kind.endswith("_tpex") else "twse"],
+        "license_url": OGDL_URL,
         "value_type": KIND_VALUE_TYPE[kind],
         "revision": revision, "checksum": checksum, "previous_checksum": previous,
         "rows": rows,
@@ -445,16 +547,32 @@ def run(base: Path) -> int:
     ]
     for kind, label, fn, source in jobs:
         try:
-            trade_date, rows = fn()
+            result = fn()
+            trade_date, rows = result[0], result[1]
+            prev_bal = result[2] if len(result) > 2 else None
             if not rows:
                 raise HarvestError("沒有任何一列通過驗證")
+            # **上市融資券的日期來自姊妹表，不是資料自帶** → 用前日餘額鏈自我驗證。
+            # 錯標的日期比沒資料更糟：回測會拿錯天的籌碼配錯天的價格，而且不報錯。
+            note = ""
+            if prev_bal:
+                prior = [d for d in stored_dates(base, kind) if d < trade_date]
+                if prior:
+                    state, why = verify_date_by_balance_chain(
+                        prev_bal, trade_date, load_day(base, kind, prior[-1]),
+                        previous_date=prior[-1])
+                    if state == VERIFY_FAILED:
+                        raise HarvestError(f"日期驗證失敗（{why}）—— 標為 {trade_date} "
+                                           f"但與前一交易日 {prior[-1]} 對不上")
+                    if state == VERIFY_SKIPPED:
+                        note = f"（日期未驗證：{why}）"
             _, rev = save(base, kind, trade_date, rows, source)
         except HarvestError as exc:
             print(f"  [FAIL ] {label:<12} {exc}")
             failed += 1
             continue
-        note = f"（修訂 rev{rev}）" if rev > 1 else ""
-        print(f"  [  OK ] {label:<12} {trade_date}　{len(rows):,} 檔{note}")
+        rev_note = f"（修訂 rev{rev}）" if rev > 1 else ""
+        print(f"  [  OK ] {label:<12} {trade_date}　{len(rows):,} 檔{rev_note}{note}")
 
     print()
     show(base)
